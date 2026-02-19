@@ -1,44 +1,55 @@
 import { google } from "googleapis";
-import { LienRecord } from "../types";
+import { RecordsRow } from "../processor/types";
+import { RECORDS_HEADERS } from "../processor/record_mapper";
+import { withRetry } from "../utils/retry";
+import { log } from "../utils/logger";
 
-export async function pushToSheets(rows: LienRecord[]): Promise<{ uploaded: number }> {
-  if (!process.env.SHEETS_KEY) {
-    throw new Error("Missing SHEETS_KEY environment variable");
-  }
-  if (!process.env.SHEET_ID) {
-    throw new Error("Missing SHEET_ID environment variable");
-  }
+const SHEET_TAB = "Records";
 
+export async function pushToSheets(rows: RecordsRow[]): Promise<{ uploaded: number }> {
+  if (!process.env.SHEETS_KEY) throw new Error("Missing SHEETS_KEY env var");
+  if (!process.env.SHEET_ID) throw new Error("Missing SHEET_ID env var");
+
+  const credentials = JSON.parse(process.env.SHEETS_KEY);
   const auth = new google.auth.GoogleAuth({
-    credentials: JSON.parse(process.env.SHEETS_KEY),
-    scopes: ["https://www.googleapis.com/auth/spreadsheets"]
+    credentials,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
 
   const sheets = google.sheets({ version: "v4", auth });
+  const spreadsheetId = process.env.SHEET_ID;
 
-  const values = rows.map(r => [
-    r.state,                   // CA
-    r.ucc_type,                // Federal Tax Lien
-    r.debtor_name,             // Full name or business
-    r.debtor_address,          // Street, City, State ZIP
-    r.file_number,             // e.g. U260005937931
-    r.secured_party_name,      // INTERNAL REVENUE SERVICE
-    r.secured_party_address,   // PO BOX 145595...
-    r.status,                  // Active / Terminated
-    r.filing_date,             // MM/DD/YYYY
-    r.lapse_date,              // MM/DD/YYYY or 12/31/9999
-    r.document_type,           // Lien Financing Stmt
-    r.pdf_filename,            // U260005937931_01202026.pdf or ""
-    r.processed ? "true" : "false",
-    r.error ?? ""
-  ]);
+  // Check if Records tab already has data (to avoid duplicate header rows)
+  const existing = await withRetry(
+    () =>
+      sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: `${SHEET_TAB}!A1:A1`,
+      }),
+    3,
+    1500
+  );
 
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: process.env.SHEET_ID,
-    range: "Sheet1!A1",
-    valueInputOption: "USER_ENTERED",
-    requestBody: { values }
-  });
+  const hasHeader = (existing.data.values?.length ?? 0) > 0;
+  const toWrite: RecordsRow[] = hasHeader ? rows : [RECORDS_HEADERS, ...rows];
 
+  if (toWrite.length === 0) {
+    log({ stage: "sheets_nothing_to_write" });
+    return { uploaded: 0 };
+  }
+
+  await withRetry(
+    () =>
+      sheets.spreadsheets.values.append({
+        spreadsheetId,
+        range: `${SHEET_TAB}!A1`,
+        valueInputOption: "USER_ENTERED",
+        requestBody: { values: toWrite },
+      }),
+    3,
+    1500
+  );
+
+  log({ stage: "sheets_uploaded", tab: SHEET_TAB, rows: rows.length, headers_written: !hasHeader });
   return { uploaded: rows.length };
 }

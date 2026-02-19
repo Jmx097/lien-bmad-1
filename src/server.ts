@@ -1,64 +1,128 @@
 import express from "express";
-import { scrapeCASOS } from "./scraper/ca_sos";
+import { scrapeCASOS, TooManyResultsError, ScrapeConfig } from "./scraper/ca_sos";
+import { parsePDFs } from "./processor/pdf_parser";
+import { mapToRecordsRows } from "./processor/record_mapper";
 import { pushToSheets } from "./sheets/push";
 import { log } from "./utils/logger";
+import { LienRecord } from "./types";
+
+// ---------------------------------------------------------------------------
+// Startup: validate required env vars before accepting any traffic
+// ---------------------------------------------------------------------------
+const REQUIRED_ENV = ["SHEETS_KEY", "SHEET_ID"] as const;
+for (const key of REQUIRED_ENV) {
+  if (!process.env[key]) {
+    console.error(`FATAL: Missing required environment variable: ${key}`);
+    process.exit(1);
+  }
+}
 
 const app = express();
 app.use(express.json());
 
+// ---------------------------------------------------------------------------
+// Health check — required for Cloud Run and load balancer probes
+// ---------------------------------------------------------------------------
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", version: "1.0.0", site: "ca_sos" });
+});
+
+// ---------------------------------------------------------------------------
+// TooManyResults handler — recursively halve date range and merge results
+// Max depth = 4 splits (so a 7-day window → 7 windows of ~12 hours)
+// ---------------------------------------------------------------------------
+function formatDate(d: Date): string {
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  return `${mm}/${dd}/${yyyy}`;
+}
+
+async function scrapeWithSplit(
+  config: ScrapeConfig,
+  depth = 0
+): Promise<LienRecord[]> {
+  const MAX_DEPTH = 4;
+  try {
+    return await scrapeCASOS(config);
+  } catch (err) {
+    if (err instanceof TooManyResultsError && depth < MAX_DEPTH) {
+      const start = new Date(config.date_start);
+      const end = new Date(config.date_end);
+      const mid = new Date((start.getTime() + end.getTime()) / 2);
+      const midStr = formatDate(mid);
+      log({ stage: "split_date_range", depth, from: config.date_start, to: config.date_end, mid: midStr });
+
+      const [first, second] = await Promise.all([
+        scrapeWithSplit({ ...config, date_end: midStr }, depth + 1),
+        scrapeWithSplit({ ...config, date_start: midStr }, depth + 1),
+      ]);
+      return [...first, ...second];
+    }
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /scrape — main endpoint
+// ---------------------------------------------------------------------------
 app.post("/scrape", async (req, res) => {
   const startTime = Date.now();
 
   try {
-    const { site, date_start, date_end, max_records } = req.body;
+    const { site, date_start, date_end, max_records } = req.body as {
+      site: string;
+      date_start: string;
+      date_end: string;
+      max_records?: number;
+    };
 
     if (!site || site !== "ca_sos") {
-      return res.status(400).json({
-        error: "MVP supports only site: ca_sos"
-      });
+      return res.status(400).json({ error: "MVP supports only site: ca_sos" });
     }
-
     if (!date_start || !date_end) {
-      return res.status(400).json({
-        error: "date_start and date_end required"
-      });
+      return res.status(400).json({ error: "date_start and date_end are required (MM/DD/YYYY)" });
     }
 
-    log({ stage: "scrape_start", site, date_start, date_end });
+    log({ stage: "pipeline_start", site, date_start, date_end, max_records });
 
-    const results = await scrapeCASOS({
-      date_start,
-      date_end,
-      max_records
-    });
+    // Stage 1: Scrape
+    const rawRecords = await scrapeWithSplit({ date_start, date_end, max_records });
+    log({ stage: "scrape_done", count: rawRecords.length });
 
-    const sheetResult = await pushToSheets(results);
+    // Stage 2: Parse PDFs for Amount
+    const enriched = await parsePDFs(rawRecords);
+    log({ stage: "pdf_parse_done", count: enriched.length });
+
+    // Stage 3: Map to Records schema
+    const rows = mapToRecordsRows(enriched);
+    log({ stage: "mapping_done", rows: rows.length });
+
+    // Stage 4: Push to Sheets (Records tab)
+    const sheetResult = await pushToSheets(rows);
 
     const duration = (Date.now() - startTime) / 1000;
-
-    log({
-      stage: "scrape_complete",
-      duration_seconds: duration,
-      records: results.length
-    });
+    log({ stage: "pipeline_complete", duration_seconds: duration, records: rawRecords.length, uploaded: sheetResult.uploaded });
 
     return res.json({
       success: true,
-      records_scraped: results.length,
+      records_scraped: rawRecords.length,
       rows_uploaded: sheetResult.uploaded,
-      duration_seconds: duration
+      duration_seconds: duration,
     });
 
-  } catch (err: any) {
-    log({ stage: "fatal_error", error: String(err) });
-
-    return res.status(500).json({
-      success: false,
-      error: err.message
-    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log({ stage: "fatal_error", error: msg });
+    return res.status(500).json({ success: false, error: msg });
   }
 });
 
-app.listen(8080, () => {
-  console.log("Server running on port 8080");
+// ---------------------------------------------------------------------------
+// Start server
+// ---------------------------------------------------------------------------
+const PORT = parseInt(process.env.PORT ?? "8080", 10);
+app.listen(PORT, () => {
+  console.log(`Lien Automation server running on port ${PORT}`);
+  console.log(`Sheet ID: ${process.env.SHEET_ID}`);
 });
